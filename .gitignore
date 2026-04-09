@@ -1,0 +1,8 @@
+.build
+.swiftpm
+.DS_Store
+.env
+*.dia
+*.d
+*.o
+*.swiftdeps
