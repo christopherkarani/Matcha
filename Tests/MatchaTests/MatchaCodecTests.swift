@@ -86,6 +86,59 @@ import Testing
   #expect(decoded == input)
 }
 
+@Test func codableRoundTripWithDateAndURL() throws {
+  struct Payload: Codable, Equatable {
+    var title: String
+    var createdAt: Date
+    var link: URL
+  }
+
+  let input = Payload(
+    title: "Test",
+    createdAt: Date(timeIntervalSince1970: 1_775_728_800),
+    link: URL(string: "https://example.com")!
+  )
+  let encoded = try MatchaEncoder().encode(input)
+  let decoded = try MatchaDecoder().decode(Payload.self, from: encoded)
+
+  #expect(decoded == input)
+}
+
+@Test func codableRoundTripWithOptionalsAndNested() throws {
+  struct Inner: Codable, Equatable {
+    var id: Int
+    var label: String
+  }
+  struct Outer: Codable, Equatable {
+    var name: String
+    var tag: String?
+    var items: [Inner]
+  }
+
+  let input = Outer(
+    name: "container",
+    tag: nil,
+    items: [Inner(id: 1, label: "first"), Inner(id: 2, label: "second")]
+  )
+  let encoded = try MatchaEncoder().encode(input)
+  let decoded = try MatchaDecoder().decode(Outer.self, from: encoded)
+
+  #expect(decoded == input)
+}
+
+@Test func codableRoundTripWithLargeUnsignedIntegers() throws {
+  struct Payload: Codable, Equatable {
+    var small: UInt8
+    var big: UInt64
+  }
+
+  let input = Payload(small: 255, big: UInt64.max)
+  let encoded = try MatchaEncoder().encode(input)
+  let decoded = try MatchaDecoder().decode(Payload.self, from: encoded)
+
+  #expect(decoded == input)
+}
+
 @Test func encoderRespectsIndentOption() throws {
   let value: MatchaValue = .object(["outer": .object(["inner": "value"])])
   let output = try MatchaEncoder(options: .init(indent: 4)).encode(value)

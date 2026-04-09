@@ -9,6 +9,7 @@ public struct MatchaEncoder: Sendable {
 
   public func encode(_ value: MatchaValue) throws -> String {
     var output = ""
+    output.reserveCapacity(4096)
     var isFirstLine = true
     try encodeLines(value) { line in
       if !isFirstLine {
@@ -21,7 +22,7 @@ public struct MatchaEncoder: Sendable {
   }
 
   public func encode<T: Encodable>(_ value: T) throws -> String {
-    try encode(MatchaJSONBridge.normalize(value))
+    try encode(matchaValueFromEncodable(value))
   }
 
   public func encodeLines(_ value: MatchaValue) throws -> [String] {
@@ -351,7 +352,7 @@ public struct MatchaDecoder: Sendable {
   }
 
   public func decode<T: Decodable>(_ type: T.Type, from input: String) throws -> T {
-    try MatchaJSONBridge.decode(type, from: decode(input))
+    try decodableFromMatchaValue(type, from: decode(input))
   }
 
   public func decodeLines<S: Sequence>(_ lines: S) throws -> MatchaValue where S.Element == String {
@@ -476,15 +477,15 @@ private final class DecoderParser {
 
     let keyToken = try parseKeyToken(content)
     index += 1
-    let rest = content.dropFirst(keyToken.end).trimmingCharacters(in: .whitespaces)
-    if rest.isEmpty {
+    let restSub = fastTrimSub(content.dropFirst(keyToken.end))
+    if restSub.isEmpty {
       if index < lines.count, lines[index].depth > currentDepth {
         return .init(key: keyToken.key, value: .object(try parseObject(baseDepth: currentDepth + 1)), wasQuoted: keyToken.wasQuoted)
       }
       return .init(key: keyToken.key, value: .object(MatchaObject()), wasQuoted: keyToken.wasQuoted)
     }
 
-    return .init(key: keyToken.key, value: try parsePrimitiveToken(String(rest)), wasQuoted: keyToken.wasQuoted)
+    return .init(key: keyToken.key, value: try parsePrimitiveToken(String(restSub)), wasQuoted: keyToken.wasQuoted)
   }
 
   private func parseArray(header: ArrayHeader, inlineValues: String?, baseDepth: Int) throws -> MatchaValue {
@@ -552,7 +553,7 @@ private final class DecoderParser {
     }
 
     let afterHyphen = String(line.content.dropFirst(2))
-    if afterHyphen.trimmingCharacters(in: .whitespaces).isEmpty {
+    if fastTrim(afterHyphen).isEmpty {
       return .object(MatchaObject())
     }
 
@@ -586,14 +587,14 @@ private final class DecoderParser {
     }
 
     let token = try parseKeyToken(content)
-    let rest = content.dropFirst(token.end).trimmingCharacters(in: .whitespaces)
-    if rest.isEmpty {
+    let restSub = fastTrimSub(content.dropFirst(token.end))
+    if restSub.isEmpty {
       if index < lines.count, lines[index].depth > currentDepth {
         return .init(key: token.key, value: .object(try parseObject(baseDepth: currentDepth + 1)), wasQuoted: token.wasQuoted)
       }
       return .init(key: token.key, value: .object(MatchaObject()), wasQuoted: token.wasQuoted)
     }
-    return .init(key: token.key, value: try parsePrimitiveToken(String(rest)), wasQuoted: token.wasQuoted)
+    return .init(key: token.key, value: try parsePrimitiveToken(String(restSub)), wasQuoted: token.wasQuoted)
   }
 
   private func validateNoBlankLines(first: Int?, last: Int?, context: String) throws {
@@ -1262,22 +1263,23 @@ private struct ParsedDocument {
 }
 
 private func parseLines(from input: String, options: MatchaDecoderOptions) throws -> ParsedDocument {
-  let rawLines = input.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+  let rawLines = input.split(separator: "\n", omittingEmptySubsequences: false)
   var parsed: [ParsedLine] = []
+  parsed.reserveCapacity(rawLines.count)
   var blankLines: [Int] = []
 
   for (offset, rawLine) in rawLines.enumerated() {
-    if rawLine.isEmpty || rawLine.trimmingCharacters(in: .whitespaces).isEmpty {
+    if rawLine.isEmpty || rawLine.utf8.allSatisfy({ $0 == 0x20 || $0 == 0x09 }) {
       blankLines.append(offset + 1)
       continue
     }
 
     var spaces = 0
     var sawTabInIndent = false
-    for character in rawLine {
-      if character == " " {
+    for byte in rawLine.utf8 {
+      if byte == 0x20 {
         spaces += 1
-      } else if character == "\t" {
+      } else if byte == 0x09 {
         sawTabInIndent = true
         break
       } else {
@@ -1309,21 +1311,23 @@ private func isListItem(_ content: String) -> Bool {
 }
 
 private func inlineValues(after content: String) -> String? {
-  guard let colonIndex = findUnquotedChar(in: content, char: ":") else { return nil }
-  let rest = content[content.index(content.startIndex, offsetBy: colonIndex + 1)...].trimmingCharacters(in: .whitespaces)
+  guard let colonIdx = findUnquotedChar(in: content, char: ":") else { return nil }
+  let afterColon = content.index(after: colonIdx)
+  let rest = fastTrim(String(content[afterColon...]))
   return rest.isEmpty ? nil : rest
 }
 
 private func parseArrayHeaderLine(_ content: String) throws -> ArrayHeader? {
-  guard let colonIndex = findUnquotedChar(in: content, char: ":") else { return nil }
-  let prefix = String(content[..<content.index(content.startIndex, offsetBy: colonIndex)])
-  guard let bracketStart = findUnquotedChar(in: prefix, char: "["),
-        let bracketEnd = prefix[braceIndex(prefix, offset: bracketStart)...].firstIndex(of: "]") else {
+  guard let colonIdx = findUnquotedChar(in: content, char: ":") else { return nil }
+  let prefix = String(content[..<colonIdx])
+  guard let bracketStartIdx = findUnquotedChar(in: prefix, char: "["),
+        let bracketEnd = prefix[bracketStartIdx...].firstIndex(of: "]") else {
     return nil
   }
 
-  let keyPart = String(prefix[..<prefix.index(prefix.startIndex, offsetBy: bracketStart)]).trimmingCharacters(in: .whitespaces)
-  let bracketContent = String(prefix[prefix.index(prefix.startIndex, offsetBy: bracketStart + 1)..<bracketEnd])
+  let keyPart = fastTrim(String(prefix[..<bracketStartIdx]))
+  let afterBracketStart = prefix.index(after: bracketStartIdx)
+  let bracketContent = String(prefix[afterBracketStart..<bracketEnd])
   let remainder = String(prefix[prefix.index(after: bracketEnd)...])
 
   let keyToken = try parseOptionalKeyToken(keyPart)
@@ -1331,7 +1335,7 @@ private func parseArrayHeaderLine(_ content: String) throws -> ArrayHeader? {
     return nil
   }
 
-  let trimmedRemainder = remainder.trimmingCharacters(in: .whitespaces)
+  let trimmedRemainder = fastTrim(remainder)
   let fields: [String]?
   if trimmedRemainder.isEmpty {
     fields = nil
@@ -1349,10 +1353,6 @@ private func parseArrayHeaderLine(_ content: String) throws -> ArrayHeader? {
     delimiter: parsedBracket.delimiter,
     fields: fields
   )
-}
-
-private func braceIndex(_ value: String, offset: Int) -> String.Index {
-  value.index(value.startIndex, offsetBy: offset)
 }
 
 private func parseBracketSegment(_ content: String) throws -> (length: Int, delimiter: MatchaDelimiter) {
@@ -1373,48 +1373,99 @@ private func parseBracketSegment(_ content: String) throws -> (length: Int, deli
 }
 
 private func parseDelimitedValues(_ input: String, delimiter: MatchaDelimiter) -> [String] {
+  let delimByte = delimiter.utf8Byte
   var values: [String] = []
-  var buffer = ""
   var inQuotes = false
-  let characters = Array(input)
-  var index = 0
+  let utf8 = input.utf8
+  var segStart = utf8.startIndex
 
-  while index < characters.count {
-    let character = characters[index]
-    if character == "\\", index + 1 < characters.count, inQuotes {
-      buffer.append(character)
-      buffer.append(characters[index + 1])
-      index += 2
-      continue
+  var pos = utf8.startIndex
+  while pos < utf8.endIndex {
+    let byte = utf8[pos]
+    if byte == 0x5C, inQuotes { // backslash
+      let next = utf8.index(after: pos)
+      if next < utf8.endIndex {
+        pos = utf8.index(after: next)
+        continue
+      }
     }
 
-    if character == "\"" {
+    if byte == 0x22 { // quote
       inQuotes.toggle()
-      buffer.append(character)
-      index += 1
+      pos = utf8.index(after: pos)
       continue
     }
 
-    if character == delimiter.rawValue, !inQuotes {
-      values.append(buffer.trimmingCharacters(in: .whitespaces))
-      buffer.removeAll(keepingCapacity: true)
-      index += 1
+    if byte == delimByte, !inQuotes {
+      values.append(trimmedASCIIWhitespace(input[segStart..<pos]))
+      pos = utf8.index(after: pos)
+      segStart = pos
       continue
     }
 
-    buffer.append(character)
-    index += 1
+    pos = utf8.index(after: pos)
   }
 
-  if !buffer.isEmpty || !values.isEmpty {
-    values.append(buffer.trimmingCharacters(in: .whitespaces))
+  if segStart < utf8.endIndex || !values.isEmpty {
+    values.append(trimmedASCIIWhitespace(input[segStart..<utf8.endIndex]))
   }
 
   return values
 }
 
+private func trimmedASCIIWhitespace(_ s: Substring) -> String {
+  let utf8 = s.utf8
+  var start = utf8.startIndex
+  var end = utf8.endIndex
+  while start < end, utf8[start] == 0x20 || utf8[start] == 0x09 {
+    start = utf8.index(after: start)
+  }
+  while end > start {
+    let prev = utf8.index(before: end)
+    guard utf8[prev] == 0x20 || utf8[prev] == 0x09 else { break }
+    end = prev
+  }
+  return String(s[start..<end])
+}
+
+private func fastTrim(_ s: String) -> String {
+  let utf8 = s.utf8
+  guard let first = utf8.first else { return s }
+  if first != 0x20, first != 0x09 {
+    guard let last = utf8.last else { return s }
+    if last != 0x20, last != 0x09 { return s }
+  }
+  var start = utf8.startIndex
+  var end = utf8.endIndex
+  while start < end, utf8[start] == 0x20 || utf8[start] == 0x09 {
+    start = utf8.index(after: start)
+  }
+  while end > start {
+    let prev = utf8.index(before: end)
+    guard utf8[prev] == 0x20 || utf8[prev] == 0x09 else { break }
+    end = prev
+  }
+  if start == utf8.startIndex, end == utf8.endIndex { return s }
+  return String(s[start..<end])
+}
+
+private func fastTrimSub(_ s: Substring) -> Substring {
+  let utf8 = s.utf8
+  var start = utf8.startIndex
+  var end = utf8.endIndex
+  while start < end, utf8[start] == 0x20 || utf8[start] == 0x09 {
+    start = utf8.index(after: start)
+  }
+  while end > start {
+    let prev = utf8.index(before: end)
+    guard utf8[prev] == 0x20 || utf8[prev] == 0x09 else { break }
+    end = prev
+  }
+  return s[start..<end]
+}
+
 private func parseOptionalKeyToken(_ content: String) throws -> (key: String, wasQuoted: Bool)? {
-  let trimmed = content.trimmingCharacters(in: .whitespaces)
+  let trimmed = fastTrim(content)
   guard !trimmed.isEmpty else { return nil }
   if trimmed.first == "\"" {
     return try (parseStringLiteral(trimmed), true)
@@ -1423,7 +1474,7 @@ private func parseOptionalKeyToken(_ content: String) throws -> (key: String, wa
 }
 
 private func parseFieldToken(_ token: String) throws -> String {
-  let trimmed = token.trimmingCharacters(in: .whitespaces)
+  let trimmed = fastTrim(token)
   if trimmed.first == "\"" {
     return try parseStringLiteral(trimmed)
   }
@@ -1431,27 +1482,29 @@ private func parseFieldToken(_ token: String) throws -> String {
 }
 
 private func parseKeyToken(_ content: String) throws -> (key: String, end: Int, wasQuoted: Bool) {
-  let characters = Array(content)
-  guard let first = characters.first else {
+  guard let firstByte = content.utf8.first else {
     throw MatchaError(.missingColon, "Expected key-value pair")
   }
 
-  if first == "\"" {
-    guard let closing = findClosingQuote(in: content, start: 0) else {
+  if firstByte == 0x22 { // quote
+    guard let closingIdx = findClosingQuote(in: content, startIndex: content.startIndex) else {
       throw MatchaError(.invalidSyntax, "Unterminated quoted key")
     }
-    guard closing + 1 < characters.count, characters[closing + 1] == ":" else {
+    let afterClosing = content.index(after: closingIdx)
+    guard afterClosing < content.endIndex, content[afterClosing] == ":" else {
       throw MatchaError(.missingColon, "Missing colon after quoted key")
     }
-    let key = try parseStringLiteral(String(characters[0...closing]))
-    return (key, closing + 2, true)
+    let key = try parseStringLiteral(String(content[content.startIndex...closingIdx]))
+    let endIdx = content.index(after: afterClosing)
+    return (key, content.distance(from: content.startIndex, to: endIdx), true)
   }
 
-  guard let colon = findUnquotedChar(in: content, char: ":") else {
+  guard let colonIdx = findUnquotedChar(in: content, char: ":") else {
     throw MatchaError(.missingColon, "Missing colon after key")
   }
-  let key = String(characters[0..<colon]).trimmingCharacters(in: .whitespaces)
-  return (key, colon + 1, false)
+  let key = fastTrim(String(content[content.startIndex..<colonIdx]))
+  let afterColon = content.index(after: colonIdx)
+  return (key, content.distance(from: content.startIndex, to: afterColon), false)
 }
 
 private func isKeyValueContent(_ content: String) -> Bool {
@@ -1459,7 +1512,7 @@ private func isKeyValueContent(_ content: String) -> Bool {
 }
 
 private func parsePrimitiveToken(_ token: String) throws -> MatchaValue {
-  let trimmed = token.trimmingCharacters(in: .whitespaces)
+  let trimmed = fastTrim(token)
   if trimmed.isEmpty {
     return .string("")
   }
@@ -1482,86 +1535,114 @@ private func parsePrimitiveToken(_ token: String) throws -> MatchaValue {
 }
 
 private func parseStringLiteral(_ token: String) throws -> String {
-  let trimmed = token.trimmingCharacters(in: .whitespaces)
-  let characters = Array(trimmed)
-  guard characters.first == "\"" else { return trimmed }
-  guard let closing = findClosingQuote(in: trimmed, start: 0) else {
+  let trimmed = fastTrim(token)
+  guard trimmed.utf8.first == 0x22 else { return trimmed } // quote
+  guard let closingIdx = findClosingQuote(in: trimmed, startIndex: trimmed.startIndex) else {
     throw MatchaError(.invalidSyntax, "Unterminated string: missing closing quote")
   }
-  guard closing == characters.count - 1 else {
+  let afterClosing = trimmed.index(after: closingIdx)
+  guard afterClosing == trimmed.endIndex else {
     throw MatchaError(.invalidSyntax, "Unexpected characters after closing quote")
   }
-  let content = String(characters[1..<closing])
+  let innerStart = trimmed.index(after: trimmed.startIndex)
+  let content = String(trimmed[innerStart..<closingIdx])
   return try unescapeString(content)
 }
 
-private func findClosingQuote(in content: String, start: Int) -> Int? {
-  let characters = Array(content)
-  var index = start + 1
-  while index < characters.count {
-    if characters[index] == "\\", index + 1 < characters.count {
-      index += 2
-      continue
+private func findClosingQuote(in content: String, startIndex: String.Index) -> String.Index? {
+  let utf8 = content.utf8
+  var pos = utf8.index(after: startIndex)
+  while pos < utf8.endIndex {
+    let byte = utf8[pos]
+    if byte == 0x5C { // backslash
+      let next = utf8.index(after: pos)
+      if next < utf8.endIndex {
+        pos = utf8.index(after: next)
+        continue
+      }
     }
-    if characters[index] == "\"" {
-      return index
+    if byte == 0x22 { // quote
+      // Convert byte position back to a valid String.Index on a Character boundary
+      return pos
     }
-    index += 1
+    pos = utf8.index(after: pos)
   }
   return nil
 }
 
-private func findUnquotedChar(in content: String, char: Character) -> Int? {
-  let characters = Array(content)
-  var index = 0
+private func findUnquotedChar(in content: String, char: Character) -> String.Index? {
+  let targetByte = UInt8(ascii: Unicode.Scalar(String(char))!)
+  let utf8 = content.utf8
+  var pos = utf8.startIndex
   var inQuotes = false
-  while index < characters.count {
-    if characters[index] == "\\", index + 1 < characters.count, inQuotes {
-      index += 2
-      continue
+  while pos < utf8.endIndex {
+    let byte = utf8[pos]
+    if byte == 0x5C, inQuotes { // backslash
+      let next = utf8.index(after: pos)
+      if next < utf8.endIndex {
+        pos = utf8.index(after: next)
+        continue
+      }
     }
-    if characters[index] == "\"" {
+    if byte == 0x22 { // quote
       inQuotes.toggle()
-      index += 1
+      pos = utf8.index(after: pos)
       continue
     }
-    if characters[index] == char, !inQuotes {
-      return index
+    if byte == targetByte, !inQuotes {
+      return pos
     }
-    index += 1
+    pos = utf8.index(after: pos)
   }
   return nil
 }
 
 private func unescapeString(_ content: String) throws -> String {
-  let characters = Array(content)
+  // Fast path: if no backslash, return content directly
+  guard content.utf8.contains(0x5C) else { return content }
+
   var result = ""
-  var index = 0
-  while index < characters.count {
-    if characters[index] == "\\" {
-      guard index + 1 < characters.count else {
+  result.reserveCapacity(content.utf8.count)
+  let utf8 = content.utf8
+  var segStart = utf8.startIndex
+  var pos = utf8.startIndex
+
+  while pos < utf8.endIndex {
+    if utf8[pos] == 0x5C { // backslash
+      // Append everything before this backslash
+      if segStart < pos {
+        result.append(contentsOf: content[segStart..<pos])
+      }
+      let next = utf8.index(after: pos)
+      guard next < utf8.endIndex else {
         throw MatchaError(.invalidEscape, "Backslash at end of string")
       }
-      switch characters[index + 1] {
-      case "n":
+      switch utf8[next] {
+      case 0x6E: // 'n'
         result.append("\n")
-      case "r":
+      case 0x72: // 'r'
         result.append("\r")
-      case "t":
+      case 0x74: // 't'
         result.append("\t")
-      case "\\":
+      case 0x5C: // '\\'
         result.append("\\")
-      case "\"":
+      case 0x22: // '"'
         result.append("\"")
       default:
-        throw MatchaError(.invalidEscape, "Invalid escape sequence: \\\(characters[index + 1])")
+        throw MatchaError(.invalidEscape, "Invalid escape sequence: \\\(content[next])")
       }
-      index += 2
+      pos = utf8.index(after: next)
+      segStart = pos
       continue
     }
-    result.append(characters[index])
-    index += 1
+    pos = utf8.index(after: pos)
   }
+
+  // Append remaining segment
+  if segStart < utf8.endIndex {
+    result.append(contentsOf: content[segStart..<utf8.endIndex])
+  }
+
   return result
 }
 
@@ -1686,12 +1767,50 @@ private func encodeKey(_ key: String) -> String {
 }
 
 private func escapeString(_ value: String) -> String {
-  value
-    .replacingOccurrences(of: "\\", with: "\\\\")
-    .replacingOccurrences(of: "\"", with: "\\\"")
-    .replacingOccurrences(of: "\n", with: "\\n")
-    .replacingOccurrences(of: "\r", with: "\\r")
-    .replacingOccurrences(of: "\t", with: "\\t")
+  let utf8 = value.utf8
+  // Fast path: check if any escaping is needed
+  var needsEscape = false
+  for byte in utf8 {
+    if byte == 0x5C || byte == 0x22 || byte == 0x0A || byte == 0x0D || byte == 0x09 {
+      needsEscape = true
+      break
+    }
+  }
+  guard needsEscape else { return value }
+
+  var result = ""
+  result.reserveCapacity(utf8.count + utf8.count / 8)
+  var segStart = utf8.startIndex
+  var pos = utf8.startIndex
+
+  while pos < utf8.endIndex {
+    let byte = utf8[pos]
+    let replacement: String
+    switch byte {
+    case 0x5C: replacement = "\\\\"
+    case 0x22: replacement = "\\\""
+    case 0x0A: replacement = "\\n"
+    case 0x0D: replacement = "\\r"
+    case 0x09: replacement = "\\t"
+    default:
+      pos = utf8.index(after: pos)
+      continue
+    }
+    // Append the non-escape segment in bulk
+    if segStart < pos {
+      result.append(contentsOf: value[segStart..<pos])
+    }
+    result.append(replacement)
+    pos = utf8.index(after: pos)
+    segStart = pos
+  }
+
+  // Append remaining segment
+  if segStart < utf8.endIndex {
+    result.append(contentsOf: value[segStart..<utf8.endIndex])
+  }
+
+  return result
 }
 
 private func formatHeader(length: Int, key: String?, fields: [String]?, delimiter: MatchaDelimiter) -> String {
@@ -1730,17 +1849,42 @@ private func isIdentifierSegment(_ key: String) -> Bool {
 }
 
 private func isSafeUnquoted(_ value: String, delimiter: MatchaDelimiter) -> Bool {
-  guard !value.isEmpty else { return false }
-  guard value == value.trimmingCharacters(in: .whitespaces) else { return false }
-  guard !["true", "false", "null"].contains(value) else { return false }
-  guard !looksNumericLike(value) else { return false }
-  guard !value.contains(":") else { return false }
-  guard !value.contains("\""), !value.contains("\\") else { return false }
-  guard !value.contains(where: { character in
-    character == "[" || character == "]" || character == "{" || character == "}" || character == "\n" || character == "\r" || character == "\t"
-  }) else { return false }
-  guard !value.contains(delimiter.rawValue) else { return false }
-  guard !value.hasPrefix("-") else { return false }
+  let utf8 = value.utf8
+  guard let first = utf8.first else { return false }
+  // Leading space or leading hyphen
+  if first == 0x20 || first == 0x2D { return false }
+  // Trailing space
+  guard utf8.last != 0x20 else { return false }
+
+  let delimByte = delimiter.utf8Byte
+
+  for byte in utf8 {
+    switch byte {
+    case 0x3A, // colon
+         0x22, // quote
+         0x5C, // backslash
+         0x5B, // [
+         0x5D, // ]
+         0x7B, // {
+         0x7D, // }
+         0x0A, // newline
+         0x0D, // carriage return
+         0x09: // tab
+      return false
+    default:
+      if byte == delimByte { return false }
+    }
+  }
+
+  // Reserved words and numeric-like checks (cheap for short strings)
+  switch value {
+  case "true", "false", "null":
+    return false
+  default:
+    break
+  }
+  if looksNumericLike(value) { return false }
+
   return true
 }
 

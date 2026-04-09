@@ -6,6 +6,14 @@ public enum MatchaDelimiter: Character, CaseIterable, Sendable {
   case pipe = "|"
 
   public static let `default`: MatchaDelimiter = .comma
+
+  var utf8Byte: UInt8 {
+    switch self {
+    case .comma: return 0x2C
+    case .tab: return 0x09
+    case .pipe: return 0x7C
+    }
+  }
 }
 
 public enum MatchaKeyFolding: String, Sendable {
