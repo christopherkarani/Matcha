@@ -1712,11 +1712,21 @@ private func indented(_ depth: Int, _ content: String, width: Int) -> String {
 }
 
 private func isValidUnquotedKey(_ key: String) -> Bool {
-  key.range(of: #"^[A-Za-z_][A-Za-z0-9_\.]*$"#, options: .regularExpression) != nil
+  guard let first = key.utf8.first else { return false }
+  guard isIdentifierStartASCII(first) else { return false }
+  for byte in key.utf8.dropFirst() {
+    guard isIdentifierBodyASCII(byte) || byte == asciiPeriod else { return false }
+  }
+  return true
 }
 
 private func isIdentifierSegment(_ key: String) -> Bool {
-  key.range(of: #"^[A-Za-z_][A-Za-z0-9_]*$"#, options: .regularExpression) != nil
+  guard let first = key.utf8.first else { return false }
+  guard isIdentifierStartASCII(first) else { return false }
+  for byte in key.utf8.dropFirst() {
+    guard isIdentifierBodyASCII(byte) else { return false }
+  }
+  return true
 }
 
 private func isSafeUnquoted(_ value: String, delimiter: MatchaDelimiter) -> Bool {
@@ -1726,13 +1736,77 @@ private func isSafeUnquoted(_ value: String, delimiter: MatchaDelimiter) -> Bool
   guard !looksNumericLike(value) else { return false }
   guard !value.contains(":") else { return false }
   guard !value.contains("\""), !value.contains("\\") else { return false }
-  guard value.range(of: #"[\[\]\{\}\n\r\t]"#, options: .regularExpression) == nil else { return false }
+  guard !value.contains(where: { character in
+    character == "[" || character == "]" || character == "{" || character == "}" || character == "\n" || character == "\r" || character == "\t"
+  }) else { return false }
   guard !value.contains(delimiter.rawValue) else { return false }
   guard !value.hasPrefix("-") else { return false }
   return true
 }
 
 private func looksNumericLike(_ value: String) -> Bool {
-  value.range(of: #"^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$"#, options: .regularExpression) != nil
-    || value.range(of: #"^0\d+$"#, options: .regularExpression) != nil
+  isNumericLiteralASCII(value)
+    || hasLeadingZeroIntegerASCII(value)
+}
+
+private let asciiPeriod: UInt8 = 46
+private let asciiUnderscore: UInt8 = 95
+
+private func isIdentifierStartASCII(_ byte: UInt8) -> Bool {
+  (65...90).contains(byte) || (97...122).contains(byte) || byte == asciiUnderscore
+}
+
+private func isIdentifierBodyASCII(_ byte: UInt8) -> Bool {
+  isIdentifierStartASCII(byte) || (48...57).contains(byte)
+}
+
+private func isNumericLiteralASCII(_ value: String) -> Bool {
+  let bytes = Array(value.utf8)
+  guard !bytes.isEmpty else { return false }
+
+  var index = 0
+  if bytes[index] == 45 { // '-'
+    index += 1
+    guard index < bytes.count else { return false }
+  }
+
+  guard scanDigits(bytes, index: &index, requireAtLeastOne: true) else { return false }
+
+  if index < bytes.count, bytes[index] == 46 { // '.'
+    index += 1
+    guard scanDigits(bytes, index: &index, requireAtLeastOne: true) else { return false }
+  }
+
+  if index < bytes.count, bytes[index] == 101 || bytes[index] == 69 { // e/E
+    index += 1
+    guard index < bytes.count else { return false }
+    if bytes[index] == 43 || bytes[index] == 45 { // +/- 
+      index += 1
+      guard index < bytes.count else { return false }
+    }
+    guard scanDigits(bytes, index: &index, requireAtLeastOne: true) else { return false }
+  }
+
+  return index == bytes.count
+}
+
+private func hasLeadingZeroIntegerASCII(_ value: String) -> Bool {
+  let bytes = Array(value.utf8)
+  guard bytes.count >= 2 else { return false }
+
+  var index = 0
+  if bytes[index] == 45 { // '-'
+    index += 1
+  }
+  guard index + 1 < bytes.count else { return false }
+  guard bytes[index] == 48 else { return false }
+  return bytes[(index + 1)...].allSatisfy { (48...57).contains($0) }
+}
+
+private func scanDigits(_ bytes: [UInt8], index: inout Int, requireAtLeastOne: Bool) -> Bool {
+  let start = index
+  while index < bytes.count, (48...57).contains(bytes[index]) {
+    index += 1
+  }
+  return requireAtLeastOne ? index > start : true
 }

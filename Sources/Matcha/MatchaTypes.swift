@@ -89,8 +89,49 @@ public struct MatchaNumber: RawRepresentable, LosslessStringConvertible, Express
   }
 
   public static func isNumericLiteral(_ value: String) -> Bool {
-    let pattern = #"^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$"#
-    return value.range(of: pattern, options: .regularExpression) != nil
+    let bytes = Array(value.utf8)
+    guard !bytes.isEmpty else { return false }
+
+    var index = 0
+    if bytes[index] == 45 { // '-'
+      index += 1
+      guard index < bytes.count else { return false }
+    }
+
+    if bytes[index] == 48 {
+      index += 1
+    } else {
+      guard (49...57).contains(bytes[index]) else { return false }
+      index += 1
+      while index < bytes.count, (48...57).contains(bytes[index]) {
+        index += 1
+      }
+    }
+
+    if index < bytes.count, bytes[index] == 46 { // '.'
+      index += 1
+      let fractionStart = index
+      while index < bytes.count, (48...57).contains(bytes[index]) {
+        index += 1
+      }
+      guard index > fractionStart else { return false }
+    }
+
+    if index < bytes.count, bytes[index] == 101 || bytes[index] == 69 { // e/E
+      index += 1
+      guard index < bytes.count else { return false }
+      if bytes[index] == 43 || bytes[index] == 45 {
+        index += 1
+        guard index < bytes.count else { return false }
+      }
+      let exponentStart = index
+      while index < bytes.count, (48...57).contains(bytes[index]) {
+        index += 1
+      }
+      guard index > exponentStart else { return false }
+    }
+
+    return index == bytes.count
   }
 }
 
